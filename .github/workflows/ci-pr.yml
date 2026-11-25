@@ -1,0 +1,92 @@
+name: CI — Checks & Terraform Plan (PR)
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  app-checks:
+    name: App Typecheck, Build & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Backend checks & tests
+        working-directory: backend
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+          npm test
+
+      - name: Serverless Function tests
+        working-directory: function
+        run: |
+          npm ci
+          npm test
+
+      - name: Frontend typecheck & build
+        working-directory: frontend
+        env:
+          VITE_ENTRA_CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
+          VITE_GA4_MEASUREMENT_ID: ${{ vars.GA4_MEASUREMENT_ID }}
+          VITE_API_BASE_URL: https://example.invalid
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+
+  terraform-plan:
+    name: Terraform Validate & Plan (GCP + Azure via OIDC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - name: Authenticate to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_OIDC_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+
+      - name: Terraform Init & Plan (GCP)
+        working-directory: infra/gcp
+        run: |
+          terraform init
+          terraform validate
+          terraform plan -no-color \
+            -var="azure_api_url=${{ vars.AZURE_API_URL || 'https://placeholder.invalid' }}" \
+            -var="allowed_cors_origins=[\"${{ vars.FRONTEND_URL || 'http://localhost:5173' }}\",\"http://localhost:5173\"]"
+
+      - name: Terraform Init & Plan (Azure)
+        working-directory: infra/azure
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_USE_AZUREAD: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_OIDC_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform init
+          terraform validate
+          terraform plan -no-color

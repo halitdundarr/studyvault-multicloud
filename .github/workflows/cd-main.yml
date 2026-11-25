@@ -1,0 +1,129 @@
+name: CD — Deploy Multi-Cloud (Main)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  build-backend-image:
+    name: Test, Build & Push Backend Docker Image (GHCR)
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Backend & Function tests
+        run: |
+          (cd backend && npm ci && npm run typecheck && npm test)
+          (cd function && npm ci && npm test)
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tag
+        id: meta
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${REPO_LOWER}/studyvault-api:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "latest=ghcr.io/${REPO_LOWER}/studyvault-api:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Backend container image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+
+  deploy-multicloud:
+    name: Terraform Apply & Deploy (GCP + Azure via OIDC)
+    needs: build-backend-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Authenticate to Google Cloud via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - name: Authenticate to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_OIDC_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+
+      - name: Terraform Apply (GCP base)
+        working-directory: infra/gcp
+        run: |
+          terraform init
+          terraform apply -auto-approve \
+            -var="azure_api_url=${{ vars.AZURE_API_URL || 'https://placeholder.invalid' }}" \
+            -var="allowed_cors_origins=[\"${{ vars.FRONTEND_URL || 'http://localhost:5173' }}\",\"http://localhost:5173\"]"
+
+      - name: Terraform Apply (Azure)
+        id: azure_tf
+        working-directory: infra/azure
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_USE_AZUREAD: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_OIDC_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform init
+          terraform apply -auto-approve \
+            -var="backend_image=${{ needs.build-backend-image.outputs.image }}"
+          echo "api_url=$(terraform output -raw api_url)" >> "$GITHUB_OUTPUT"
+          echo "frontend_url=$(terraform output -raw frontend_url)" >> "$GITHUB_OUTPUT"
+          SWA_TOKEN=$(terraform output -raw static_web_app_deployment_token)
+          echo "::add-mask::$SWA_TOKEN"
+          echo "swa_token=$SWA_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Cross-Cloud Webhook URL & CORS in GCP
+        working-directory: infra/gcp
+        run: |
+          terraform apply -auto-approve \
+            -var="azure_api_url=${{ steps.azure_tf.outputs.api_url }}" \
+            -var="allowed_cors_origins=[\"${{ steps.azure_tf.outputs.frontend_url }}\",\"http://localhost:5173\"]"
+
+      - name: Build & Deploy Frontend to Azure Static Web Apps
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ steps.azure_tf.outputs.api_url }}
+          VITE_ENTRA_CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
+          VITE_GA4_MEASUREMENT_ID: ${{ vars.GA4_MEASUREMENT_ID }}
+          SWA_CLI_DEPLOYMENT_TOKEN: ${{ steps.azure_tf.outputs.swa_token }}
+        run: |
+          npm ci
+          npm run build
+          npx --yes @azure/static-web-apps-cli deploy ./dist \
+            --deployment-token "$SWA_CLI_DEPLOYMENT_TOKEN" \
+            --env production
